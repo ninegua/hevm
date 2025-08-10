@@ -11,6 +11,7 @@ import Control.Monad (when, forM_, unless)
 import Control.Monad.ST (RealWorld, stToIO)
 import Control.Monad.IO.Unlift
 import Control.Exception (try, IOException)
+import Data.Aeson.Optics
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Char8 as BC
@@ -19,11 +20,12 @@ import Data.List (intersperse, intercalate)
 import Data.Maybe (fromMaybe, mapMaybe, fromJust, isNothing, isJust)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
+import qualified Data.Vector as V
 import Data.Version (showVersion)
 import Data.Word (Word64)
 import GHC.Conc (getNumProcessors)
 import Numeric.Natural (Natural)
-import Optics.Core ((&), set)
+import Optics.Core ((&), set, (^?), (%))
 import Witch (unsafeInto)
 import Options.Generic as OptionsGeneric
 import Options.Applicative as Options
@@ -35,7 +37,7 @@ import Data.List.Split (splitOn)
 import Text.Read (readMaybe)
 
 import EVM (initialContract, abstractContract, makeVm)
-import EVM.ABI (Sig(..))
+import EVM.ABI (makeAbiValue, abiMethod, AbiValue(..), AbiType, Sig(..))
 import EVM.Dapp (dappInfo, DappInfo, emptyDapp)
 import EVM.Expr qualified as Expr
 import EVM.Concrete qualified as Concrete
@@ -250,12 +252,22 @@ execOptions = ExecOptions
   <$> projectTypeParser
   <*> createParser
 
+data AbiEncodeOptions = AbiEncodeOptions
+  { abi ::Maybe Text
+  , arg :: [String]
+  }
+abiEncodeOptions :: Parser AbiEncodeOptions
+abiEncodeOptions = AbiEncodeOptions
+  <$> (optional $ strOption $ long "abi" <> help "Signature of types to decode/encode")
+  <*> argParser
+
 -- Combined options data type
 data Command
   = Symbolic   CommonFileOptions SymbolicOptions CommonExecOptions CommonOptions
   | Equal      EqOptions CommonOptions
   | Test       TestOptions  CommonOptions
   | Exec       CommonFileOptions ExecOptions CommonExecOptions CommonOptions
+  | AbiEncode  AbiEncodeOptions
   | Version
 
 -- Parser for the subcommands
@@ -277,6 +289,9 @@ commandParser = subparser
       (info (Exec <$> commonFileOptions <*> execOptions <*> commonExecOptions <*> commonOptions <**> helper)
         (progDesc "Concretely execute a given program"
         <> footer "For more help, see https://hevm.dev/exec.html" ))
+  <> command "abiencode"
+      (info (AbiEncode <$> abiEncodeOptions <**> helper)
+        (progDesc "encode arguments using ABI"))
   <> command "version"
       (info (pure Version)
         (progDesc "Show the version of the tool"))
@@ -309,6 +324,7 @@ main = do
     )
 
   case cmd of
+    AbiEncode aOpts -> abiencode' aOpts
     Symbolic cFileOpts symbOpts cExecOpts cOpts -> do
       env <- makeEnv cOpts
       root <- getRoot cOpts
@@ -824,3 +840,21 @@ unitTestOptions testOpts cOpts solvers buildOutput = do
 parseInitialStorage :: InitialStorage -> BaseState
 parseInitialStorage Empty = EmptyBase
 parseInitialStorage Abstract = AbstractBase
+
+parseAbi :: (AsValue s) => s -> (Text, [AbiType])
+parseAbi abijson =
+  (signature abijson, snd
+    <$> parseMethodInput
+    <$> V.toList
+      (fromMaybe (internalError "Malformed function abi") (abijson ^? key "inputs" % _Array)))
+
+abiencode :: (AsValue s) => Maybe s -> [String] -> ByteString
+abiencode Nothing _ = internalError "missing required argument: abi"
+abiencode (Just abijson) args =
+  let (sig', declarations) = parseAbi abijson
+  in if length declarations == length args
+     then abiMethod sig' $ AbiTuple . V.fromList $ zipWith makeAbiValue declarations args
+     else internalError $ "wrong number of arguments:" <> show (length args) <> ": " <> show args
+
+abiencode' :: AbiEncodeOptions -> IO ()
+abiencode' opts = print . ByteStringS $ abiencode (opts.abi) (opts.arg)
